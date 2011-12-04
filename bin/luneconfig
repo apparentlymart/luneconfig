@@ -175,7 +175,8 @@ sub perl_from_lua {
         my $arr = [];
         $L->pushnil(); # placeholder first key to start iteration
         while ($L->next($value_idx)) {
-            if ($L->isstring(-2)) {
+            my $typename = $L->typename($L->type(-2));
+            if ($typename eq 'string') {
                 my $k = $L->tostring(-2);
                 my $v;
                 # If $uckeysonly flag is set, ignore
@@ -191,15 +192,16 @@ sub perl_from_lua {
                     $hash->{$k} = $v;
                 }
             }
-            else {
+            elsif ($typename eq 'number') {
                 # assume the key is an integer.
-                # non-integer, non-string values
-                # will just be treated as zero.
+                # fractional values will be rounded
                 my $idx = $L->tointeger(-2);
-                warn "Integer key $idx in $name";
                 my $v;
                 perl_from_lua($L, \$v, name => "${name}[$idx]");
                 $arr->[$idx] = $v;
+            }
+            else {
+                die "$name contains a key of unsupported type $typename (must be string or integer)\n";
             }
             # Leave key on the top of the stack
             # for the next iteration.
@@ -215,6 +217,7 @@ sub perl_from_lua {
             # lua's list are 1-indexed, so shift up
             # to make it 0-indexed
             shift @$arr unless defined($arr->[0]);
+            $$target = $arr;
         }
     }
     elsif ($L->isnumber($value_idx)) {
