@@ -39,15 +39,18 @@ while (my $env = readdir(ENVDIR)) {
 
     opendir(APPDIR, $app_dir) || die "Failed to open directory $app_dir: $!\n";
     while (my $app = readdir(APPDIR)) {
-        next if -d $app;
-        next unless $app =~ s/\.conf$//;
+        next unless -d "$app_dir/$app";
+        next if $app =~ m!^\.!;
 
         my $env_config_file = "$env_dir/$env.conf";
-        my $app_config_file = "$app_dir/$app.conf";
+        my $app_config_file = "$app_dir/$app/$env.conf";
         my $output_file = "$output_dir/${app}_${env}.json";
+
+        next unless -f $app_config_file;
 
         my $L = Lua::API::State->new();
         $L->openlibs();
+        $L->register("vars", \&lua_vars_function);
 
         # First obtain the globals from the environment
         # file, which will be the "env" variable in the
@@ -78,7 +81,7 @@ while (my $env = readdir(ENVDIR)) {
 
         my $result;
         perl_from_lua($L, \$result,
-            name => $app,
+            name => "$app.$env",
             uckeysonly => 1,
         );
 
