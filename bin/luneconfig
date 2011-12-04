@@ -1,0 +1,266 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+luneconfig - Configuration file wrangler using Lua syntax
+
+=head1 SYNOPSIS
+
+    Usage: luneconfig <inputdir> <outputdir>
+
+=cut
+
+use strict;
+use Lua::API;
+use Pod::Usage;
+use Getopt::Long;
+use JSON::XS;
+
+# No options yet, but still fail if invalid options are passed.
+Getopt::Long::GetOptions() || Pod::Usage::pod2usage(1);
+
+my $input_dir = shift || Pod::Usage::pod2usage(1);
+my $output_dir = shift || Pod::Usage::pod2usage(1);
+
+my $env_dir = "$input_dir/environments";
+my $app_dir = "$input_dir/apps";
+my $var_dir = "$input_dir/vars";
+
+my $json = JSON::XS->new();
+$json->utf8(1);
+$json->pretty(1);
+$json->space_before(0);
+$json->canonical(1);
+
+opendir(ENVDIR, $env_dir) || die "Failed to open directory $env_dir: $!\n";
+while (my $env = readdir(ENVDIR)) {
+    next if -d $env;
+    next unless $env =~ s/\.conf$//;
+
+    opendir(APPDIR, $app_dir) || die "Failed to open directory $app_dir: $!\n";
+    while (my $app = readdir(APPDIR)) {
+        next if -d $app;
+        next unless $app =~ s/\.conf$//;
+
+        my $env_config_file = "$env_dir/$env.conf";
+        my $app_config_file = "$app_dir/$app.conf";
+        my $output_file = "$output_dir/${app}_${env}.json";
+
+        my $L = Lua::API::State->new();
+        $L->openlibs();
+
+        # First obtain the globals from the environment
+        # file, which will be the "env" variable in the
+        # scope of the app config file.
+        get_globals_from_file($L, $env_config_file);
+
+        # Make the environment name available as the
+        # special "name" property of the environment table.
+        $L->pushstring($env);
+        $L->setfield(-2, "name");
+
+        # Now put the environment table (which is at the
+        # top of the stack) in the app config scope.
+        $L->setglobal("env");
+
+        # Finally we evaluate the app config file within
+        # the main thread.
+        my $errored = $L->loadfile($app_config_file);
+        die_lua_error($L) if $errored;
+        $errored = $L->pcall(0, 0, undef);
+        die_lua_error($L) if $errored;
+
+        # Now get hold of the global scope of the
+        # main thread so we can extract the config
+        # settings from it.
+        $L->pushthread();
+        $L->getfenv(-1);
+
+        my $result;
+        perl_from_lua($L, \$result,
+            name => $app,
+            uckeysonly => 1,
+        );
+
+        open(OUT, '>', $output_file) || die "Failed to open $output_file for writing: $!\n";
+        print OUT $json->encode($result);
+        close(OUT);
+
+    }
+    closedir(APPDIR);
+}
+closedir(ENVDIR);
+
+# Evaluates a given file in a separate global scope
+# and then leave the resulting globals table on
+# the top of the stack of the given state.
+sub get_globals_from_file {
+    my ($L, $fn) = @_;
+
+    # Create a child "thread" (state) for
+    # evaluating the file.
+    my $cL = $L->newthread();
+
+    # Give the child thread its own
+    # globals table.
+    # newthread left it on the stack for us
+    # to mess with.
+    $L->newtable();
+    # Stack is (thread, table); setfenv
+    # sets the global scope of the thread at
+    # the top of the stack to the table at
+    # -2, which we created above.
+    $L->setfenv(-2);
+
+    # Poke the standard library into the child
+    # scope too.
+    $cL->openlibs();
+
+    # Install the "vars" function.
+    $cL->register("vars", \&lua_vars_function);
+
+    my $errored = $cL->loadfile($fn);
+    die_lua_error($cL) if $errored;
+
+    # Make a protected call so we don't
+    # end up propagating a Lua error across
+    # a perl stack frame; otherwise we'll
+    # screw up Perl's internal state.
+    $errored = $cL->pcall(0, 0, undef);
+    die_lua_error($cL) if $errored;
+
+    # By now we have the child thread
+    # at -1 on the stack of the parent,
+    # so we can grab its global scope onto the
+    # parent scope stack.
+    $L->getfenv(-1);
+
+    # Now we have both the child thread
+    # and the global scope table on the
+    # stack. We only want to return the
+    # scope, so we remove (and thus free)
+    # the thread.
+    $L->remove(-2);
+
+    # Only the topmost item on the stack
+    # is our return value.
+    return 1;
+}
+
+# Take the thing at the top of the lua
+# stack and turn it into an equivalent
+# Perl value, then assign it into the
+# scalar passed by ref.
+sub perl_from_lua {
+    my ($L, $target, %opts) = @_;
+
+    my $uckeysonly = delete $opts{uckeysonly} || 0;
+    my $name = delete $opts{name} || '';
+    die "Unsupported opt(s): ".join(', ', keys %opts) if %opts;
+
+    my $value_idx = $L->gettop();
+
+    if ($L->isstring($value_idx)) {
+        $$target = $L->tostring($value_idx);
+    }
+    elsif ($L->istable($value_idx)) {
+        # Iterate over all of the elements of the
+        # table. We put integer keys in an array
+        # and non-integer keys in a hash. If the
+        # hash is empty when we're done then we
+        # return a list. Otherwise we merge the
+        # array into the hash and return that.
+        # Simple! :)
+        my $hash = {};
+        my $arr = [];
+        $L->pushnil(); # placeholder first key to start iteration
+        while ($L->next($value_idx)) {
+            if ($L->isstring(-2)) {
+                my $k = $L->tostring(-2);
+                my $v;
+                # If $uckeysonly flag is set, ignore
+                # non-uppercase keys as well as Lua's
+                # special variable _G which is a recursive
+                # reference back to the global scope.
+                if ($uckeysonly && ($k =~ m!^_! || uc($k) ne $k)) {
+                    # Just ignore this value
+                    $L->pop(1);
+                }
+                else {
+                    perl_from_lua($L, \$v, name => "${name}.${k}");
+                    $hash->{$k} = $v;
+                }
+            }
+            else {
+                # assume the key is an integer.
+                # non-integer, non-string values
+                # will just be treated as zero.
+                my $idx = $L->tointeger(-2);
+                warn "Integer key $idx in $name";
+                my $v;
+                perl_from_lua($L, \$v, name => "${name}[$idx]");
+                $arr->[$idx] = $v;
+            }
+            # Leave key on the top of the stack
+            # for the next iteration.
+        }
+        if (%$hash) {
+            # lua's lists are 1-indexed, so we skip 0
+            for (my $i = 1; $i < scalar(@$arr); $i++) {
+                $hash->{$i} = $arr->[$i];
+            }
+            $$target = $hash;
+        }
+        else {
+            # lua's list are 1-indexed, so shift up
+            # to make it 0-indexed
+            shift @$arr unless defined($arr->[0]);
+        }
+    }
+    elsif ($L->isnumber($value_idx)) {
+        $$target = $L->tonumber($value_idx);
+    }
+    elsif ($L->isnil($value_idx)) {
+        $$target = undef;
+    }
+    elsif ($L->isboolean($value_idx)) {
+        # Coerce to values that the JSON library will
+        # consider to be booleans.
+        $$target = $L->toboolean($value_idx) ? \1 : \0;
+    }
+    else {
+        die "Failed to extract $name: not a supported type\n";
+    }
+
+    # Now remove our original value from the stack.
+    $L->pop(1);
+
+}
+
+sub lua_vars_function {
+    my ($L) = @_;
+
+    if ($L->gettop != 1) {
+        $L->pushstring("'vars' takes exactly one argument");
+        $L->error;
+        return 0;
+    }
+
+    my $fn = $L->tostring(1);
+    my $full_fn = "$var_dir/$fn.conf";
+
+    get_globals_from_file($L, $full_fn);
+
+    # get_globals_from_file left the global
+    # scope at the top of the stack, so we
+    # can now just return it.
+    return 1;
+}
+
+sub die_lua_error {
+    my ($L) = @_;
+
+    my $msg = $L->tostring(-1);
+    die "$msg\n";
+}
+
